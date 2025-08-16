@@ -1,0 +1,26 @@
+# 내구도 확인 및 초기화                    
+c.execute("SELECT pi.durability, i.max_durability FROM player_inventory pi JOIN items i ON pi.item_id = i.id WHERE pi.user_id = ? AND i.name = ?", (interaction.user.id, '낡은 곡괭이'))                    
+durability_info = c.fetchone()                    
+current_durability = durability_info['durability']                    
+max_durability = durability_info['max_durability']                    
+if current_durability is None:                        
+current_durability = max_durability                    
+# 내구도 감소                    
+new_durability = current_durability - 1                    
+c.execute("UPDATE player_inventory SET durability = ? WHERE user_id = ? AND item_id = (SELECT id FROM items WHERE name = ?)", (new_durability, interaction.user.id, '낡은 곡괭이'))                    
+conn.commit()                    
+if new_durability <= 0:                        
+c.execute("DELETE FROM player_inventory WHERE user_id = ? AND item_id = (SELECT id FROM items WHERE name = ?)", (interaction.user.id, '낡은 곡괭이'))                        
+conn.commit()                        
+response_message += "낡은 곡괭이가 부서졌습니다!\n"                    
+conn.close()                    
+await asyncio.sleep(3) # 채광하는 시간                    
+ore_roll = random.random()                   
+ if ore_roll < 0.6:                        
+await self.add_item_to_inventory(interaction.user.id, "철광석")                       
+ response_message += "반짝이는 철광석을 발견하여 채집했습니다!"                   
+ elif ore_roll < 0.9:                        
+await self.add_item_to_inventory(interaction.user.id, "돌멩이")                        
+response_message += "돌멩이만 잔뜩 나왔습니다."                   
+ else:                        
+response_message += "아무것도 찾지 못했습니다."
