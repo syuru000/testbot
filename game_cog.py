@@ -25,14 +25,14 @@ MONSTERS = {
 
 # --- 전투 UI ---
 class BattleView(discord.ui.View):
-    def __init__(self, bot, player_id, monster_name, game_cog_instance, battle_message: discord.Message):
+    def __init__(self, bot, player_id, monster_name, game_cog_instance):
         super().__init__(timeout=60)
         self.bot = bot
         self.player_id = player_id
         self.monster_name = monster_name
         self.monster = MONSTERS[monster_name].copy()
         self.game_cog = game_cog_instance
-        self.battle_message = battle_message # 수정할 메시지 객체
+        self.battle_message: discord.Message = None # 나중에 설정될 메시지 객체
         
 
     async def on_timeout(self):
@@ -58,7 +58,7 @@ class BattleView(discord.ui.View):
 
     @discord.ui.button(label="공격", style=discord.ButtonStyle.danger)
     async def attack(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await interaction.response.defer() # 상호작용 응답
+        await interaction.response.defer()
 
         from main import get_db_connection
         conn = get_db_connection()
@@ -67,7 +67,6 @@ class BattleView(discord.ui.View):
         c.execute("SELECT * FROM players WHERE user_id = ?", (self.player_id,))
         player_data = c.fetchone()
 
-        # 플레이어 데이터가 없는 경우 처리
         if not player_data:
             await self.battle_message.edit(content="오류: 플레이어 정보를 찾을 수 없습니다.", view=None)
             await self.handle_battle_end()
@@ -179,11 +178,13 @@ class GameCog(commands.Cog):
         elif interaction.channel_id == self.bot.ice_channel_id:
             required_role_id = self.bot.channel_2_role_id
         else:
+            # defer()가 호출되기 전이므로 response 사용 가능
             await interaction.response.send_message("이 명령어는 게임 채널에서만 사용할 수 있습니다.", ephemeral=True)
             return False
 
         required_role = interaction.guild.get_role(required_role_id)
         if not required_role or required_role not in interaction.user.roles:
+            # defer()가 호출되기 전이므로 response 사용 가능
             await interaction.response.send_message("이 채널에 입장할 수 있는 역할이 없습니다.", ephemeral=True)
             return False
         return True
@@ -224,8 +225,6 @@ class GameCog(commands.Cog):
             durability = item.max_durability if item.max_durability is not None else None
             c.execute("INSERT INTO player_inventory (user_id, item_id, quantity, durability) VALUES (?, ?, ?, ?)", (user_id, item.id, quantity, durability))
         else: # 아이템이 존재하지만, 스택 불가능한 아이템일 경우
-            # 현재 정책상 스택 불가능한 아이템은 1개만 소유 가능하므로, 추가 획득을 막거나 다른 처리가 필요.
-            # 여기서는 일단 아무것도 하지 않음.
             pass
 
         conn.commit()
@@ -239,7 +238,6 @@ class GameCog(commands.Cog):
             conn = get_db_connection()
             c = conn.cursor()
 
-            # 아이템 정보 조회
             c.execute("""
                 SELECT i.id, pi.durability, i.max_durability 
                 FROM player_inventory pi 
@@ -255,15 +253,12 @@ class GameCog(commands.Cog):
             current_durability = item_info['durability']
             max_durability = item_info['max_durability']
 
-            # 내구도가 없는 아이템이면 아무것도 하지 않음
             if max_durability is None:
                 return True, ""
 
-            # 기존 아이템의 내구도가 NULL일 경우 최대치로 초기화
             if current_durability is None:
                 current_durability = max_durability
 
-            # 내구도 감소
             new_durability = current_durability - 1
             
             message = ""
@@ -329,8 +324,10 @@ class GameCog(commands.Cog):
         if interaction.user.id in self.active_users:
             return await interaction.response.send_message("이미 다른 행동을 하고 있습니다.", ephemeral=True)
 
+        await interaction.response.defer(ephemeral=True)
+
         if item_name not in self.recipes:
-            return await interaction.response.send_message("제작할 수 없는 아이템입니다.", ephemeral=True)
+            return await interaction.followup.send("제작할 수 없는 아이템입니다.")
 
         recipe = self.recipes[item_name]
         
@@ -340,23 +337,20 @@ class GameCog(commands.Cog):
             conn = get_db_connection()
             c = conn.cursor()
 
-            # 재료 확인
             for material, required_amount in recipe.items():
                 c.execute("SELECT pi.quantity FROM player_inventory pi JOIN items i ON pi.item_id = i.id WHERE pi.user_id = ? AND i.name = ?", (interaction.user.id, material))
                 result = c.fetchone()
                 if not result or result['quantity'] < required_amount:
-                    await interaction.response.send_message(f"재료가 부족합니다: {material} {required_amount}개 필요", ephemeral=True)
+                    await interaction.followup.send(f"재료가 부족합니다: {material} {required_amount}개 필요")
                     return
             
-            # 재료 소모
             for material, required_amount in recipe.items():
                 c.execute("UPDATE player_inventory SET quantity = quantity - ? WHERE user_id = ? AND item_id = (SELECT id FROM items WHERE name = ?)", (required_amount, interaction.user.id, material))
 
-            # 제작된 아이템 추가
             item_to_add = self.item_manager.get_item_by_name(item_name)
             if not item_to_add:
-                await interaction.response.send_message("제작하려는 아이템 정보를 찾을 수 없습니다.", ephemeral=True)
-                conn.rollback() # 오류 발생 시 롤백
+                await interaction.followup.send("제작하려는 아이템 정보를 찾을 수 없습니다.")
+                conn.rollback()
                 return
 
             c.execute("SELECT quantity FROM player_inventory WHERE user_id = ? AND item_id = ?", (interaction.user.id, item_to_add.id))
@@ -367,13 +361,13 @@ class GameCog(commands.Cog):
                 c.execute("INSERT INTO player_inventory (user_id, item_id, quantity) VALUES (?, ?, 1)", (interaction.user.id, item_to_add.id))
 
             conn.commit()
-            await interaction.response.send_message(f"축하합니다! {item_name}을(를) 제작했습니다.", ephemeral=False)
+            await interaction.followup.send(f"축하합니다! {item_name}을(를) 제작했습니다.", ephemeral=False)
 
         except sqlite3.Error as e:
             print(f"/제작 명령어 처리 중 데이터베이스 오류 발생: {e}")
             if conn:
                 conn.rollback()
-            await interaction.response.send_message("제작 중 오류가 발생했습니다. 다시 시도해주세요.", ephemeral=True)
+            await interaction.followup.send("제작 중 오류가 발생했습니다. 다시 시도해주세요.")
         finally:
             if conn:
                 conn.close()
@@ -381,6 +375,8 @@ class GameCog(commands.Cog):
     @game_group.command(name="인벤토리", description="현재 가지고 있는 아이템을 확인합니다.")
     async def inventory(self, interaction: discord.Interaction):
         if not await self._check_game_channel_and_role(interaction): return
+        await interaction.response.defer(ephemeral=True)
+        
         from main import get_db_connection
         conn = get_db_connection()
         c = conn.cursor()
@@ -394,7 +390,7 @@ class GameCog(commands.Cog):
         conn.close()
 
         if not items:
-            return await interaction.response.send_message("인벤토리가 비어있습니다.", ephemeral=True)
+            return await interaction.followup.send("인벤토리가 비어있습니다.")
 
         embed = discord.Embed(title="🎒 인벤토리", color=discord.Color.blue())
         for item in items:
@@ -409,7 +405,7 @@ class GameCog(commands.Cog):
 
             embed.add_field(name=item_name, value=value, inline=True)
         
-        await interaction.response.send_message(embed=embed, ephemeral=True)
+        await interaction.followup.send(embed=embed)
 
     @game_group.command(name="직업선택", description="직업을 선택합니다. 한 번 선택하면 변경할 수 없습니다.")
     @app_commands.describe(job_name="선택할 직업의 이름 (검사, 마법사)")
@@ -419,6 +415,8 @@ class GameCog(commands.Cog):
     ])
     async def choose_job(self, interaction: discord.Interaction, job_name: str):
         if not await self._check_game_channel_and_role(interaction): return
+        await interaction.response.defer(ephemeral=True)
+
         from main import get_db_connection
         conn = get_db_connection()
         c = conn.cursor()
@@ -428,52 +426,51 @@ class GameCog(commands.Cog):
 
         if current_job != '초보자':
             conn.close()
-            return await interaction.response.send_message(f"이미 직업을 선택했습니다: {current_job}", ephemeral=True)
+            return await interaction.followup.send(f"이미 직업을 선택했습니다: {current_job}")
 
         if job_name not in ["검사", "마법사"]:
             conn.close()
-            return await interaction.response.send_message("유효하지 않은 직업 이름입니다. '검사' 또는 '마법사' 중에서 선택해주세요.", ephemeral=True)
+            return await interaction.followup.send("유효하지 않은 직업 이름입니다. '검사' 또는 '마법사' 중에서 선택해주세요.")
 
         c.execute("UPDATE players SET job = ?, skp = 1 WHERE user_id = ?", (job_name, interaction.user.id))
         conn.commit()
         conn.close()
 
-        await interaction.response.send_message(f"축하합니다! 당신은 이제 {job_name}이(가) 되었습니다. 스킬 포인트 1을 획득했습니다.", ephemeral=False)
+        await interaction.followup.send(f"축하합니다! 당신은 이제 {job_name}이(가) 되었습니다. 스킬 포인트 1을 획득했습니다.", ephemeral=False)
 
     @game_group.command(name="아이템사용", description="인벤토리의 아이템을 사용합니다.")
     @app_commands.autocomplete(item_name=item_autocomplete)
     async def use_item(self, interaction: discord.Interaction, item_name: str):
         if not await self._check_game_channel_and_role(interaction): return
+        await interaction.response.defer(ephemeral=False)
+
         from main import get_db_connection
         conn = get_db_connection()
         c = conn.cursor()
 
-        # 1. 플레이어 인벤토리에서 아이템 확인
         c.execute("SELECT pi.quantity, i.id, i.item_type, i.effect_type, i.effect_value FROM player_inventory pi JOIN items i ON pi.item_id = i.id WHERE pi.user_id = ? AND i.name = ?", (interaction.user.id, item_name))
         item_info = c.fetchone()
 
         if not item_info:
             conn.close()
-            return await interaction.response.send_message(f"인벤토리에 '{item_name}'이(가) 없습니다.", ephemeral=True)
+            return await interaction.followup.send(f"인벤토리에 '{item_name}'이(가) 없습니다.", ephemeral=True)
 
         quantity, item_id, item_type, effect_type, effect_value = item_info
 
-        # item 객체를 다시 가져옴 (effect_name 접근을 위해)
         item = self.item_manager.get_item(item_id)
         if not item:
             conn.close()
-            return await interaction.response.send_message("아이템 정보를 찾을 수 없습니다.", ephemeral=True)
+            return await interaction.followup.send("아이템 정보를 찾을 수 없습니다.", ephemeral=True)
 
         if item_type != 'consumable':
             conn.close()
-            return await interaction.response.send_message(f"'{item_name}'은(는) 사용할 수 있는 아이템이 아닙니다.", ephemeral=True)
+            return await interaction.followup.send(f"'{item_name}'은(는) 사용할 수 있는 아이템이 아닙니다.", ephemeral=True)
 
-        # 2. 아이템 사용 로직
         response_message = ""
         if effect_type == 'hp_recovery':
             c.execute("SELECT hp, level FROM players WHERE user_id = ?", (interaction.user.id,))
             player_hp, player_level = c.fetchone()
-            max_hp = 100 + (player_level - 1) * 10 # 레벨에 따른 최대 HP (예시)
+            max_hp = 100 + (player_level - 1) * 10
             
             recovered_hp = min(max_hp - player_hp, effect_value)
             if recovered_hp <= 0:
@@ -482,12 +479,12 @@ class GameCog(commands.Cog):
                 c.execute("UPDATE players SET hp = hp + ? WHERE user_id = ?", (recovered_hp, interaction.user.id))
                 response_message = f"'{item_name}'을(를) 사용하여 체력 {recovered_hp}을(를) 회복했습니다. (현재 HP: {player_hp + recovered_hp})"
         elif effect_type == 'attack_boost':
-            buff_duration = effect_value # effect_value를 버프 지속 시간(초)으로 사용
+            buff_duration = effect_value
             buff_end_time = time.time() + buff_duration
             c.execute("UPDATE players SET attack_buff_until = ? WHERE user_id = ?", (buff_end_time, interaction.user.id))
             response_message = f"'{item_name}'을(를) 사용하여 공격력이 {buff_duration}초 동안 증가했습니다!"
         elif effect_type == 'status_effect_apply':
-            status_duration = effect_value # effect_value를 상태 이상 지속 시간(초)으로 사용
+            status_duration = effect_value
             status_end_time = time.time() + status_duration
             c.execute("UPDATE players SET status_effect = ?, status_effect_end_time = ? WHERE user_id = ?", (item.effect_name, status_end_time, interaction.user.id))
             response_message = f"'{item_name}'을(를) 사용하여 {item.effect_name} 상태 이상을 {status_duration}초 동안 부여했습니다!"
@@ -496,7 +493,6 @@ class GameCog(commands.Cog):
         else:
             response_message = f"'{item_name}'은(는) 현재 사용해도 아무런 효과가 없습니다."
 
-        # 3. 인벤토리에서 아이템 수량 감소
         if quantity > 1:
             c.execute("UPDATE player_inventory SET quantity = quantity - 1 WHERE user_id = ? AND item_id = ?", (interaction.user.id, item_id))
         else:
@@ -504,7 +500,7 @@ class GameCog(commands.Cog):
         
         conn.commit()
         conn.close()
-        await interaction.response.send_message(response_message, ephemeral=False)
+        await interaction.followup.send(response_message)
 
     @game_group.command(name="입장", description="특정 채널에 입장하기 위한 역할을 받습니다.")
     @app_commands.describe(channel="입장할 채널을 선택하세요.")
@@ -516,6 +512,8 @@ class GameCog(commands.Cog):
         if interaction.channel_id == self.bot.wind_channel_id or interaction.channel_id == self.bot.ice_channel_id:
             return await interaction.response.send_message("이 명령어는 Wind/Ice 채널에서 사용할 수 없습니다.", ephemeral=True)
 
+        await interaction.response.defer(ephemeral=True)
+
         role_id_to_add = self.bot.channel_1_role_id if channel == "wind" else self.bot.channel_2_role_id
         role_id_to_remove = self.bot.channel_2_role_id if channel == "wind" else self.bot.channel_1_role_id
         
@@ -523,18 +521,23 @@ class GameCog(commands.Cog):
         role_to_remove = interaction.guild.get_role(role_id_to_remove)
 
         if not role_to_add:
-            return await interaction.response.send_message(f"'{channel}' 채널 역할을 찾을 수 없습니다. 관리자에게 문의하세요.", ephemeral=True)
+            return await interaction.followup.send(f"'{channel}' 채널 역할을 찾을 수 없습니다. 관리자에게 문의하세요.")
 
         try:
             await interaction.user.add_roles(role_to_add)
             if role_to_remove and role_to_remove in interaction.user.roles:
                 await interaction.user.remove_roles(role_to_remove)
-            await interaction.response.send_message(f"'{role_to_add.name}' 역할을 부여받았습니다! 이제 해당 채널에 입장할 수 있습니다.", ephemeral=False)
+            await interaction.followup.send(f"'{role_to_add.name}' 역할을 부여받았습니다! 이제 해당 채널에 입장할 수 있습니다.", ephemeral=False)
         except discord.Forbidden:
-            await interaction.response.send_message("역할을 부여할 권한이 없습니다.", ephemeral=True)
+            await interaction.followup.send("역할을 부여할 권한이 없습니다.")
 
     @game_group.command(name="채널나가기", description="현재 입장해 있는 채널에서 나갑니다.")
     async def leave_channel(self, interaction: discord.Interaction):
+        if interaction.channel_id != self.bot.wind_channel_id and interaction.channel_id != self.bot.ice_channel_id:
+            return await interaction.response.send_message("이 명령어는 Wind 또는 Ice 채널에서만 사용할 수 없습니다.", ephemeral=True)
+
+        await interaction.response.defer(ephemeral=True)
+        
         role_to_remove = None
         channel_name = ""
 
@@ -544,24 +547,24 @@ class GameCog(commands.Cog):
         elif interaction.channel_id == self.bot.ice_channel_id:
             role_to_remove = interaction.guild.get_role(self.bot.channel_2_role_id)
             channel_name = "Ice"
-        else:
-            return await interaction.response.send_message("이 명령어는 Wind 또는 Ice 채널에서만 사용할 수 있습니다.", ephemeral=True)
-
+        
         if not role_to_remove:
-            return await interaction.response.send_message(f"'{channel_name}' 채널 역할을 찾을 수 없습니다. 관리자에게 문의하세요.", ephemeral=True)
+            return await interaction.followup.send(f"'{channel_name}' 채널 역할을 찾을 수 없습니다. 관리자에게 문의하세요.")
 
         if role_to_remove not in interaction.user.roles:
-            return await interaction.response.send_message(f"'{channel_name}' 채널에 입장해 있지 않습니다.", ephemeral=True)
+            return await interaction.followup.send(f"'{channel_name}' 채널에 입장해 있지 않습니다.")
 
         try:
             await interaction.user.remove_roles(role_to_remove)
-            await interaction.response.send_message(f"'{role_to_remove.name}' 이제 해당 채널에서 나갔습니다.", ephemeral=False)
+            await interaction.followup.send(f"'{role_to_remove.name}' 이제 해당 채널에서 나갔습니다.", ephemeral=False)
         except discord.Forbidden:
-            await interaction.response.send_message("역할을 제거할 권한이 없습니다.", ephemeral=True)
+            await interaction.followup.send("역할을 제거할 권한이 없습니다.")
 
     @game_group.command(name="주변", description="현재 위치의 정보와 이동 가능한 장소를 봅니다.")
     async def look_around(self, interaction: discord.Interaction):
         if not await self._check_game_channel_and_role(interaction): return
+        await interaction.response.defer(ephemeral=False)
+
         from main import get_db_connection
         conn = get_db_connection()
         c = conn.cursor()
@@ -570,7 +573,7 @@ class GameCog(commands.Cog):
 
         if not current_location:
             conn.close()
-            return await interaction.response.send_message("오류: 현재 위치를 찾을 수 없습니다.", ephemeral=True)
+            return await interaction.followup.send("오류: 현재 위치를 찾을 수 없습니다.")
 
         c.execute("SELECT l.name FROM map_connections mc JOIN locations l ON mc.to_location_id = l.id WHERE mc.from_location_id = ?", (current_location['id'],))
         possible_moves = [row['name'] for row in c.fetchall()]
@@ -586,7 +589,7 @@ class GameCog(commands.Cog):
             actions = json.loads(current_location['actions'])
             embed.add_field(name="가능한 행동", value=" / ".join(actions), inline=False)
 
-        await interaction.response.send_message(embed=embed, ephemeral=False)
+        await interaction.followup.send(embed=embed)
 
     @game_group.command(name="이동", description="다른 장소로 이동합니다.")
     @app_commands.autocomplete(destination=move_autocomplete)
@@ -629,6 +632,9 @@ class GameCog(commands.Cog):
         if interaction.user.id in self.active_users:
             return await interaction.response.send_message("이미 다른 행동을 하고 있습니다.", ephemeral=True)
 
+        await interaction.response.defer(ephemeral=False)
+        self.active_users.add(interaction.user.id)
+
         from main import get_db_connection
         conn = get_db_connection()
         c = conn.cursor()
@@ -638,26 +644,27 @@ class GameCog(commands.Cog):
         c.execute("SELECT monster_name FROM location_monsters WHERE location_id = ?", (player_location_id,))
         possible_monsters = [row['monster_name'] for row in c.fetchall()]
         conn.close()
-
-        self.active_users.add(interaction.user.id)
         
         try:
             if possible_monsters and random.random() < 0.7:
                 monster_name = random.choice(possible_monsters)
-                # 초기 메시지를 보내고 메시지 객체를 BattleView에 전달
-                initial_message = await interaction.channel.send(f"야생의 {monster_name}이(가) 나타났다! 어떻게 하시겠습니까?", view=None)
-                view = BattleView(self.bot, interaction.user.id, monster_name, self, initial_message)
-                await initial_message.edit(view=view)
+                # 1. View 객체를 먼저 생성합니다.
+                view = BattleView(self.bot, interaction.user.id, monster_name, self)
+                # 2. 메시지를 보낼 때 View를 함께 첨부합니다.
+                message = await interaction.followup.send(f"야생의 {monster_name}이(가) 나타났다! 어떻게 하시겠습니까?", view=view, wait=True)
+                # 3. 생성된 View에 방금 보낸 메시지 객체를 설정해줍니다.
+                view.battle_message = message
             else:
                 if random.random() < 0.2:
                     await self.add_item_to_inventory(interaction.user.id, "기초 회복 물약")
-                    await interaction.response.send_message("반짝이는 기초 회복 물약을 발견하여 획득했습니다!", ephemeral=False)
+                    await interaction.followup.send("반짝이는 기초 회복 물약을 발견하여 획득했습니다!")
                 else:
-                    await interaction.response.send_message("아무 일도 일어나지 않았습니다.", ephemeral=False)
+                    await interaction.followup.send("아무 일도 일어나지 않았습니다.")
                 self.active_users.discard(interaction.user.id)
         except Exception as e:
             print(f"탐험 중 오류: {e}")
-            self.active_users.discard(interaction.user.id)
+            if interaction.user.id in self.active_users:
+                self.active_users.discard(interaction.user.id)
 
     @game_group.command(name="행동", description="현재 위치에서 특정 행동을 합니다.")
     @app_commands.autocomplete(action_name=action_autocomplete)
@@ -667,7 +674,6 @@ class GameCog(commands.Cog):
             await interaction.response.send_message("이미 다른 행동을 하고 있습니다.", ephemeral=True)
             return
 
-        # 명령어 시작 시 defer를 먼저 호출합니다.
         await interaction.response.defer(ephemeral=False)
 
         from main import get_db_connection
@@ -693,7 +699,6 @@ class GameCog(commands.Cog):
         self.active_users.add(interaction.user.id)
         response_message = f"당신은 {action_name}을(를) 시도합니다...\n\n"
         try:
-            # 행동에 따른 실제 로직 구현
             if action_name == "덤불 살피기":
                 if random.random() < 0.5:
                     await self.add_item_to_inventory(interaction.user.id, "나뭇가지")
@@ -738,7 +743,7 @@ class GameCog(commands.Cog):
                     if not rod_name:
                         response_message = "낚싯대가 없습니다."
                     else:
-                        await asyncio.sleep(2) # 낚시하는 시간
+                        await asyncio.sleep(2)
                         success, durability_message = await self._use_tool(interaction.user.id, rod_name)
                         if not success:
                             response_message = durability_message
@@ -762,7 +767,7 @@ class GameCog(commands.Cog):
                 elif not await self._has_item(interaction.user.id, "낡은 곡괭이"):
                     response_message = "곡괭이가 없습니다."
                 else:
-                    await asyncio.sleep(3) # 채광하는 시간
+                    await asyncio.sleep(3)
                     success, durability_message = await self._use_tool(interaction.user.id, "낡은 곡괭이")
                     if not success:
                         response_message = durability_message
@@ -777,7 +782,6 @@ class GameCog(commands.Cog):
                         if durability_message:
                             response_message += f"\n{durability_message}"
             
-            # 모든 처리가 끝난 후 마지막에 한 번만 응답합니다.
             await interaction.followup.send(response_message)
 
         except Exception as e:
@@ -789,6 +793,8 @@ class GameCog(commands.Cog):
     @game_group.command(name="스탯", description="자신의 스탯 정보를 확인합니다.")
     async def stats(self, interaction: discord.Interaction):
         if not await self._check_game_channel_and_role(interaction): return
+        await interaction.response.defer(ephemeral=True)
+        
         from main import get_db_connection
         conn = get_db_connection()
         c = conn.cursor()
@@ -797,9 +803,8 @@ class GameCog(commands.Cog):
         conn.close()
 
         if player:
-            # 스탯 계산 (예시)
-            calculated_attack = player['strength'] + player['swordsmanship'] # 예시 계산
-            calculated_defense = player['strength'] # 예시 계산
+            calculated_attack = player['strength'] + player['swordsmanship']
+            calculated_defense = player['strength']
 
             embed = discord.Embed(title=f"⚔️ {player['nickname']}님의 스탯 정보", color=discord.Color.purple())
             embed.add_field(name="HP", value=f"{player['hp']}", inline=True)
@@ -812,13 +817,15 @@ class GameCog(commands.Cog):
             embed.add_field(name="관찰", value=f"{player['observation']}", inline=True)
             embed.add_field(name="수마법", value=f"{player['water_magic']}", inline=True)
             embed.add_field(name="시야", value=f"{player['sight']}", inline=True)
-            await interaction.response.send_message(embed=embed, ephemeral=True)
+            await interaction.followup.send(embed=embed)
         else:
-            await interaction.response.send_message("플레이어 정보를 찾을 수 없습니다.", ephemeral=True)
+            await interaction.followup.send("플레이어 정보를 찾을 수 없습니다.")
 
     @game_group.command(name="스킬포인트", description="보유한 스킬 포인트를 확인합니다.")
     async def skill_points(self, interaction: discord.Interaction):
         if not await self._check_game_channel_and_role(interaction): return
+        await interaction.response.defer(ephemeral=True)
+
         from main import get_db_connection
         conn = get_db_connection()
         c = conn.cursor()
@@ -828,9 +835,9 @@ class GameCog(commands.Cog):
 
         if player:
             skp = player['skp']
-            await interaction.response.send_message(f"현재 보유한 스킬 포인트는 {skp}점입니다.", ephemeral=True)
+            await interaction.followup.send(f"현재 보유한 스킬 포인트는 {skp}점입니다.")
         else:
-            await interaction.response.send_message("플레이어 정보를 찾을 수 없습니다.", ephemeral=True)
+            await interaction.followup.send("플레이어 정보를 찾을 수 없습니다.")
 
 async def setup(bot: commands.Bot):
     await bot.add_cog(GameCog(bot))

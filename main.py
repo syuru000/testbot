@@ -95,7 +95,10 @@ bot.chat_lock = asyncio.Lock()
 
 # --- DB 헬퍼 ---
 def get_db_connection():
-    conn = sqlite3.connect('game.db')
+    # timeout을 15초로 늘려 DB 잠금 오류를 줄입니다.
+    conn = sqlite3.connect('game.db', timeout=15)
+    # WAL 모드를 활성화하여 동시성(concurrency)을 높입니다.
+    conn.execute("PRAGMA journal_mode=WAL")
     conn.row_factory = sqlite3.Row
     return conn
 
