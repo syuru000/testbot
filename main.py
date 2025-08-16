@@ -15,7 +15,7 @@ import os # os 모듈 추가
 # --- 웹 서버 설정 (24시간 호스팅용) ---
 app = Flask('')
 
-@app.route('/')
+@app.route('/', methods=['GET', 'HEAD'])
 def home():
     return "The bot is alive!"
 
